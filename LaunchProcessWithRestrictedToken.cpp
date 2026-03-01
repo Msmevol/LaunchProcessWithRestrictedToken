@@ -121,6 +121,11 @@ static int  g_NetworkFilterPort = 8080;
 static std::wstring g_NetworkFilterAllowedUrls;
 
 // Bun Virtual Drive (B:\~BUN) state
+//   0 = auto     : extract DLL + map B: drive (if available) + fallback copies (default)
+//   1 = extract  : extract DLL + fallback copies + PATH injection only, no B: drive mapping
+//   2 = disabled : skip all Bun VFS preparation entirely
+static int g_BunVfsMode = 0;
+
 static volatile LONG g_BunCleanupDone = 0;
 static bool g_BunDriveMapped = false;
 static std::wstring g_BunStagingDir;
@@ -129,6 +134,19 @@ static std::vector<std::wstring> g_BunFallbackDirs;
 
 static volatile LONG g_RestoreDone = 0;
 static volatile LONG g_PathAclModified = 0;
+
+// Deny paths blacklist (directories child process cannot access)
+static std::vector<std::wstring> g_DenyPaths;
+static std::vector<SavedSecurity> g_SavedDenySecurity;
+static volatile LONG g_DenyRestoreDone = 0;
+static volatile LONG g_DenyAclModified = 0;
+
+// Deny tools blacklist (executables child process cannot run)
+static std::vector<std::wstring> g_DenyTools;
+static std::vector<std::wstring> g_DenyToolResolved;
+static std::vector<SavedSecurity> g_SavedToolSecurity;
+static volatile LONG g_ToolRestoreDone = 0;
+static volatile LONG g_ToolAclModified = 0;
 
 // Log file state
 static HANDLE g_LogFile = INVALID_HANDLE_VALUE;
@@ -1058,6 +1076,36 @@ static bool ParsePathPrependListFromArg(PCWSTR arg) {
 	return ParsePathPrependList(buf.data());
 }
 
+static void ParseSemicolonList(PCWSTR input, std::vector<std::wstring>& out) {
+	if (!input) return;
+	std::wstring s = TrimCopy(input);
+	if (s.size() >= 2 && s.front() == L'"' && s.back() == L'"')
+		s = s.substr(1, s.size() - 2);
+	std::vector<wchar_t> buf(s.begin(), s.end());
+	buf.push_back(L'\0');
+	WCHAR* ctx = nullptr;
+	for (WCHAR* tok = wcstok_s(buf.data(), L";,", &ctx); tok; tok = wcstok_s(nullptr, L";,", &ctx)) {
+		std::wstring raw = TrimCopy(tok);
+		if (raw.size() >= 2 && raw.front() == L'"' && raw.back() == L'"')
+			raw = raw.substr(1, raw.size() - 2);
+		if (!raw.empty()) {
+			bool dup = false;
+			for (const auto& existing : out) {
+				if (_wcsicmp(existing.c_str(), raw.c_str()) == 0) { dup = true; break; }
+			}
+			if (!dup) out.push_back(raw);
+		}
+	}
+}
+
+static void ParseDenyPathsFromArg(PCWSTR arg) {
+	ParseSemicolonList(arg, g_DenyPaths);
+}
+
+static void ParseDenyToolsFromArg(PCWSTR arg) {
+	ParseSemicolonList(arg, g_DenyTools);
+}
+
 static void PrintUsage() {
 	wprintf(L"LaunchSandbox.exe Usage:\r\n");
 	wprintf(L"\t-m Moniker -i ExeToLaunch -a Path1;Path2 -e K1=V1;K2=V2 -p Dir1;Dir2 -s -w -x\r\n");
@@ -1344,6 +1392,185 @@ static void RestoreSavedSecurityOnce() {
 	if (InterlockedCompareExchange(&g_RestoreDone, 1, 0) != 0) return;
 	if (InterlockedCompareExchange(&g_PathAclModified, 0, 0) == 1) {
 		RestoreSavedSecurity();
+	}
+}
+
+// ========================================================================
+// Deny ACL Helpers (for denyPaths / denyTools blacklists)
+// ========================================================================
+
+static DWORD DenyAccessOnPath(PCWSTR path, PSID sid, DWORD denyMask) {
+	PSECURITY_DESCRIPTOR sd = nullptr;
+	PACL oldDacl = nullptr;
+	DWORD dw = GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+		nullptr, nullptr, &oldDacl, nullptr, &sd);
+	if (dw != ERROR_SUCCESS) {
+		LogError(L"[DenyACL] GetNamedSecurityInfoW failed on %ls: err=%lu", path, dw);
+		return dw;
+	}
+
+	EXPLICIT_ACCESSW ea{};
+	ea.grfAccessPermissions = denyMask;
+	ea.grfAccessMode = DENY_ACCESS;
+	ea.grfInheritance = SUB_CONTAINERS_AND_OBJECTS_INHERIT;
+	BuildTrusteeWithSidW(&ea.Trustee, sid);
+
+	PACL newDacl = nullptr;
+	dw = SetEntriesInAclW(1, &ea, oldDacl, &newDacl);
+	if (dw != ERROR_SUCCESS) {
+		LogError(L"[DenyACL] SetEntriesInAclW failed on %ls: err=%lu", path, dw);
+		if (sd) LocalFree(sd);
+		return dw;
+	}
+
+	dw = SetNamedSecurityInfoW(const_cast<LPWSTR>(path), SE_FILE_OBJECT,
+		DACL_SECURITY_INFORMATION, nullptr, nullptr, newDacl, nullptr);
+	if (dw != ERROR_SUCCESS) {
+		LogError(L"[DenyACL] SetNamedSecurityInfoW failed on %ls: err=%lu", path, dw);
+	}
+	if (newDacl) LocalFree(newDacl);
+	if (sd) LocalFree(sd);
+	return dw;
+}
+
+static DWORD SaveDenySecurityForPath(PCWSTR path, std::vector<SavedSecurity>& saveVec) {
+	SavedSecurity ss{};
+	ss.path = path;
+	DWORD dw = GetNamedSecurityInfoW(path, SE_FILE_OBJECT, DACL_SECURITY_INFORMATION,
+		nullptr, nullptr, &ss.dacl, nullptr, &ss.sdDacl);
+	if (dw == ERROR_SUCCESS) {
+		ss.hasDacl = true;
+		SECURITY_DESCRIPTOR_CONTROL ctrl = 0;
+		DWORD rev = 0;
+		if (GetSecurityDescriptorControl(ss.sdDacl, &ctrl, &rev))
+			ss.daclProtected = (ctrl & SE_DACL_PROTECTED) != 0;
+	}
+	saveVec.push_back(std::move(ss));
+	return dw;
+}
+
+static void RestoreDenySecurityVec(std::vector<SavedSecurity>& vec, const wchar_t* tag) {
+	int ok = 0, fail = 0;
+	for (auto& ss : vec) {
+		if (!ss.hasDacl) continue;
+		DWORD dw = RestoreDaclWithProtection(ss);
+		if (dw == ERROR_SUCCESS) ++ok;
+		else { LogWarn(L"[%ls] Failed to restore DACL on %ls (err=%lu)", tag, ss.path.c_str(), dw); ++fail; }
+	}
+	vec.clear();
+	LogInfo(L"[%ls] Restore: ok=%d, fail=%d", tag, ok, fail);
+}
+
+// -- Deny Paths --
+
+static void ApplyDenyPaths(PSID sid) {
+	if (g_DenyPaths.empty()) return;
+	int applied = 0, skipped = 0, failed = 0;
+	for (const auto& dp : g_DenyPaths) {
+		DWORD attrs = GetFileAttributesW(dp.c_str());
+		if (attrs == INVALID_FILE_ATTRIBUTES) {
+			LogWarn(L"[DenyPaths] Path not found, skipping: %ls", dp.c_str());
+			++skipped; continue;
+		}
+		SaveDenySecurityForPath(dp.c_str(), g_SavedDenySecurity);
+		DWORD dw = DenyAccessOnPath(dp.c_str(), sid, FILE_ALL_ACCESS);
+		if (dw == ERROR_SUCCESS) {
+			InterlockedExchange(&g_DenyAclModified, 1);
+			++applied;
+			LogInfo(L"[DenyPaths] DENY ALL applied on: %ls", dp.c_str());
+		} else {
+			++failed;
+		}
+	}
+	LogInfo(L"[DenyPaths] Summary: applied=%d, skipped=%d, failed=%d (total=%llu)",
+		applied, skipped, failed, (unsigned long long)g_DenyPaths.size());
+}
+
+static void RestoreDenyPathsOnce() {
+	if (InterlockedCompareExchange(&g_DenyRestoreDone, 1, 0) != 0) return;
+	if (InterlockedCompareExchange(&g_DenyAclModified, 0, 0) == 1) {
+		RestoreDenySecurityVec(g_SavedDenySecurity, L"DenyPaths");
+	}
+}
+
+// -- Deny Tools --
+
+static std::wstring ResolveToolFullPath(const std::wstring& tool) {
+	// If already a full path, use it directly
+	if (tool.find(L'\\') != std::wstring::npos || tool.find(L'/') != std::wstring::npos) {
+		DWORD a = GetFileAttributesW(tool.c_str());
+		if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) return tool;
+		return L"";
+	}
+	// Search PATH for the tool name
+	wchar_t fullPath[MAX_PATH * 2] = {};
+	DWORD n = SearchPathW(nullptr, tool.c_str(), L".exe", _countof(fullPath), fullPath, nullptr);
+	if (n > 0 && n < _countof(fullPath)) return std::wstring(fullPath, n);
+	// Try common system directories manually
+	const wchar_t* sysDirs[] = {
+		L"C:\\Windows\\System32",
+		L"C:\\Windows\\System32\\WindowsPowerShell\\v1.0",
+		L"C:\\Windows\\SysWOW64",
+		L"C:\\Windows",
+	};
+	for (const auto* dir : sysDirs) {
+		std::wstring candidate = std::wstring(dir) + L"\\" + tool;
+		DWORD a = GetFileAttributesW(candidate.c_str());
+		if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) return candidate;
+		// Try adding .exe if not present
+		if (ToLowerCopy(candidate).rfind(L".exe") == std::wstring::npos) {
+			candidate += L".exe";
+			a = GetFileAttributesW(candidate.c_str());
+			if (a != INVALID_FILE_ATTRIBUTES && !(a & FILE_ATTRIBUTE_DIRECTORY)) return candidate;
+		}
+	}
+	return L"";
+}
+
+static void ResolveDenyTools() {
+	g_DenyToolResolved.clear();
+	for (const auto& tool : g_DenyTools) {
+		std::wstring resolved = ResolveToolFullPath(tool);
+		if (resolved.empty()) {
+			LogWarn(L"[DenyTools] Cannot resolve tool '%ls', skipping.", tool.c_str());
+		} else {
+			// Avoid duplicates
+			bool dup = false;
+			for (const auto& r : g_DenyToolResolved) {
+				if (PathEqualsInsensitive(r, resolved)) { dup = true; break; }
+			}
+			if (!dup) {
+				g_DenyToolResolved.push_back(resolved);
+				LogInfo(L"[DenyTools] Resolved: '%ls' -> '%ls'", tool.c_str(), resolved.c_str());
+			}
+		}
+	}
+}
+
+static void ApplyDenyTools(PSID sid) {
+	if (g_DenyToolResolved.empty()) return;
+	int applied = 0, failed = 0;
+	for (const auto& toolPath : g_DenyToolResolved) {
+		SaveDenySecurityForPath(toolPath.c_str(), g_SavedToolSecurity);
+		// Deny read + execute so the tool cannot be loaded at all
+		DWORD denyMask = FILE_GENERIC_READ | FILE_GENERIC_EXECUTE;
+		DWORD dw = DenyAccessOnPath(toolPath.c_str(), sid, denyMask);
+		if (dw == ERROR_SUCCESS) {
+			InterlockedExchange(&g_ToolAclModified, 1);
+			++applied;
+			LogInfo(L"[DenyTools] DENY RX applied on: %ls", toolPath.c_str());
+		} else {
+			++failed;
+		}
+	}
+	LogInfo(L"[DenyTools] Summary: applied=%d, failed=%d (total=%llu)",
+		applied, failed, (unsigned long long)g_DenyToolResolved.size());
+}
+
+static void RestoreDenyToolsOnce() {
+	if (InterlockedCompareExchange(&g_ToolRestoreDone, 1, 0) != 0) return;
+	if (InterlockedCompareExchange(&g_ToolAclModified, 0, 0) == 1) {
+		RestoreDenySecurityVec(g_SavedToolSecurity, L"DenyTools");
 	}
 }
 
@@ -1822,6 +2049,13 @@ static std::wstring ResolveExeFullPath(PCWSTR exeName) {
 
 static bool PrepareBunVirtualDrive() {
 	if (!ExeToLaunch) return false;
+
+	// [Mode] disabled = skip everything
+	if (g_BunVfsMode == 2) {
+		LogInfo(L"[BunVFS] Mode=disabled, skipping all Bun VFS preparation.");
+		return false;
+	}
+
 	std::wstring image = ParseImagePathFromCommandLine(ExeToLaunch);
 	std::wstring nameLower = ToLowerCopy(GetFileNamePart(image));
 	if (nameLower.find(L"opencode") == std::wstring::npos) return false;
@@ -1878,11 +2112,19 @@ static bool PrepareBunVirtualDrive() {
 
 	if (!dllDir.empty() && DirectoryExists(dllDir)) AddPathPrependUnique(dllDir);
 
-	if (bDriveAvailable) {
+	// [Mode] auto(0) = map B: drive; extract(1) = skip mapping, fallback + PATH only
+	if (g_BunVfsMode == 0 && bDriveAvailable) {
 		if (DefineDosDeviceW(0, L"B:", g_BunStagingDir.c_str())) {
 			g_BunDriveMapped = true;
 			g_BunDriveTarget = g_BunStagingDir;
+			LogInfo(L"[BunVFS] Mode=auto, B: drive mapped to %ls", g_BunStagingDir.c_str());
 		}
+	} else if (g_BunVfsMode == 1) {
+		LogInfo(L"[BunVFS] Mode=extract, B: drive mapping skipped. "
+		        L"DLL extracted to fallback paths + PATH injection only. "
+		        L"Bun internal VFS expected to handle B:\\~BUN runtime access.");
+	} else if (g_BunVfsMode == 0 && !bDriveAvailable) {
+		LogWarn(L"[BunVFS] Mode=auto, but B: drive already in use (type=%u). Using fallback only.", driveType);
 	}
 
 	if (!dllPath.empty()) {
@@ -2355,11 +2597,28 @@ static bool LoadConfigFromIniIfNoArgs(int argc) {
 	}
 	g_NetworkFilterAllowedUrls = TrimCopy(ReadIniString(ini, L"networkFilterAllowedUrls"));
 
+	// Bun VFS mode: auto(0), extract(1), disabled(2)
+	auto bunVfsStr = ToLowerCopy(TrimCopy(ReadIniString(ini, L"bunVfsMode")));
+	if (!bunVfsStr.empty()) {
+		if (bunVfsStr == L"auto" || bunVfsStr == L"0") g_BunVfsMode = 0;
+		else if (bunVfsStr == L"extract" || bunVfsStr == L"1") g_BunVfsMode = 1;
+		else if (bunVfsStr == L"disabled" || bunVfsStr == L"2") g_BunVfsMode = 2;
+		else LogWarn(L"[Config] Unknown bunVfsMode '%ls', using auto.", bunVfsStr.c_str());
+	}
+
+	// Deny blacklists
+	auto denyPathsStr = ReadIniString(ini, L"denyPaths");
+	if (!denyPathsStr.empty()) ParseDenyPathsFromArg(denyPathsStr.c_str());
+	auto denyToolsStr = ReadIniString(ini, L"denyTools");
+	if (!denyToolsStr.empty()) ParseDenyToolsFromArg(denyToolsStr.c_str());
+
 	LogInfo(L"[Config] Final: wait=%d, lowIntegrity=%d, cleanup=%d, newConsole=%d, "
-		L"hideParent=%d, log=%d, integrityLevel=%d, networkFilter=%d",
+		L"hideParent=%d, log=%d, integrityLevel=%d, networkFilter=%d, bunVfsMode=%d, "
+		L"denyPaths=%llu, denyTools=%llu",
 		WaitForExit ? 1 : 0, PathLowIntegrity ? 1 : 0, CleanupAllowedSubdirs ? 1 : 0,
 		UseNewConsole ? 1 : 0, HideParentConsole ? 1 : 0, g_LogEnabled ? 1 : 0,
-		IntegrityLevel, g_NetworkFilterEnabled ? 1 : 0);
+		IntegrityLevel, g_NetworkFilterEnabled ? 1 : 0, g_BunVfsMode,
+		(unsigned long long)g_DenyPaths.size(), (unsigned long long)g_DenyTools.size());
 	return true;
 }
 
@@ -2416,6 +2675,8 @@ static BOOL WINAPI OnConsoleCtrl(DWORD ctrlType) {
 		TerminateParentConsoleHostIfAlive();
 		ShutdownNetworkFilter();
 		CleanupBunVirtualDrive();
+		RestoreDenyToolsOnce();
+		RestoreDenyPathsOnce();
 		RestoreSavedSecurityOnce();
 		return TRUE;
 	default:
@@ -2490,6 +2751,12 @@ int wmain(int argc, WCHAR** argv) {
 			PTOKEN_USER pTokenUser = (PTOKEN_USER)LocalAlloc(LPTR, tokenUserLen);
 			if (pTokenUser && GetTokenInformation(hToken, TokenUser, pTokenUser, tokenUserLen, &tokenUserLen)) {
 				if (!AllowedPaths.empty()) GrantAccessToAllowedPaths(pTokenUser->User.Sid);
+				// Apply deny blacklists
+				if (!g_DenyPaths.empty()) ApplyDenyPaths(pTokenUser->User.Sid);
+				if (!g_DenyTools.empty()) {
+					ResolveDenyTools();
+					if (!g_DenyToolResolved.empty()) ApplyDenyTools(pTokenUser->User.Sid);
+				}
 			}
 			if (pTokenUser) LocalFree(pTokenUser);
 		}
@@ -2522,6 +2789,8 @@ int wmain(int argc, WCHAR** argv) {
 		HANDLE hCleanup = CreateThread(nullptr, 0, [](LPVOID) -> DWORD {
 			ShutdownNetworkFilter();
 			CleanupBunVirtualDrive();
+			RestoreDenyToolsOnce();
+			RestoreDenyPathsOnce();
 			RestoreSavedSecurityOnce();
 			return 0;
 			}, nullptr, 0, nullptr);
